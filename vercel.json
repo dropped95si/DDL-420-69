@@ -1,9 +1,11 @@
 {
   "version": 2,
-  "outputDirectory": "ui",
-  "cleanUrls": true,
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
+  "builds": [
+    { "src": "ui/**/*", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "handle": "filesystem" },
+    { "src": "/.*", "dest": "/index.html" }
   ],
   "headers": [
     {
