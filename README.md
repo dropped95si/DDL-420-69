@@ -57,7 +57,15 @@ This repo can integrate with open-source research stacks, but they are optional 
 - FinRL Yahoo download (open-source data):
   - `python -m ddl69.cli.main finrl_download --tickers AAPL,SPY --start 2020-01-01`
 
-### Open-source repos
+## Deploy (Vercel + Cloudflare, static UI)
+- Build: none; UI is pure static. Vercel config is in `vercel.json`.
+- DNS (Cloudflare):  
+  - CNAME `@` -> `cname.vercel-dns.com` (Proxied ON)  
+  - CNAME `www` -> `cname.vercel-dns.com` (Proxied ON)  
+  - Remove old A/AAAA for apex/www if present.
+- Vercel domains: add `stazmediacorp.com` + `www.stazmediacorp.com` (and `agilera.ai` + `www.agilera.ai` if needed). Set apex as primary; enable redirect `www` -> apex.
+- SSL: Cloudflare SSL/TLS mode “Full” (or “Full strict”), then enable “Always Use HTTPS” + “Automatic HTTPS Rewrites.”
+- Verify: `https://www.domain` should 301 to `https://domain` and render the UI.
 - FinRL: https://github.com/AI4Finance-Foundation/FinRL
 - FinGPT: https://github.com/AI4Finance-Foundation/FinGPT
 - Qlib: https://github.com/microsoft/qlib
