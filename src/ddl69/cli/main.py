@@ -370,17 +370,17 @@ def signals_run(
 
 @app.command()
 def train_walkforward(
-    bars: str = typer.Option(
-        "C:\\Users\\Stas\\Downloads\\HistoricalData_1769169971316.csv",
-        help="Path to historical bars CSV",
+    bars: Optional[str] = typer.Option(
+        None,
+        help="Path to historical bars CSV [env: BARS_PATH]",
     ),
-    labels: str = typer.Option(
-        "C:\\Users\\Stas\\Downloads\\signals_rows.csv",
-        help="Path to signals_rows.csv",
+    labels: Optional[str] = typer.Option(
+        None,
+        help="Path to signals_rows.csv [env: SIGNALS_PATH]",
     ),
-    signals: str = typer.Option(
-        "C:\\Users\\Stas\\Downloads\\signal_registry_top50_pack.zip",
-        help="Path to signal registry pack (zip or dir)",
+    signals: Optional[str] = typer.Option(
+        None,
+        help="Path to signal registry pack (zip or dir) [env: SIGNAL_REGISTRY_PATH]",
     ),
     expand_rules: bool = typer.Option(True, help="Expand learned_top_rules from historical bars"),
     horizon: int = typer.Option(5, help="Forward horizon in bars for rule scoring"),
@@ -392,6 +392,17 @@ def train_walkforward(
     method: str = typer.Option("hedge", help="Weight method"),
 ) -> None:
     settings = Settings()
+    bars = bars or os.getenv("BARS_PATH")
+    labels = labels or os.getenv("SIGNALS_PATH")
+    signals = signals or os.getenv("SIGNAL_REGISTRY_PATH")
+    qlib_dir = qlib_dir or os.getenv("QLIB_DIR")
+
+    if not bars or not Path(bars).exists():
+        raise typer.BadParameter(f"Bars file missing: {bars or 'BARS_PATH not set'}")
+    if not labels or not Path(labels).exists():
+        raise typer.BadParameter(f"Signals/labels file missing: {labels or 'SIGNALS_PATH not set'}")
+    if not signals or not Path(signals).exists():
+        raise typer.BadParameter(f"Signal registry missing: {signals or 'SIGNAL_REGISTRY_PATH not set'}")
     ledger = SupabaseLedger(settings)
     store = ParquetStore(settings)
 
@@ -909,6 +920,11 @@ def refresh_daily(
     max_symbols: int = typer.Option(50, help="Max symbols to fetch when universe is used"),
     source: str = typer.Option("auto", help="auto/polygon/alpaca/yahoo/local"),
     upload_storage: bool = typer.Option(True, help="Upload Parquet to Supabase Storage"),
+    bars: Optional[str] = typer.Option(None, help="Path to historical bars CSV [env: BARS_PATH]"),
+    labels: Optional[str] = typer.Option(None, help="Path to signals_rows.csv [env: SIGNALS_PATH]"),
+    signals: Optional[str] = typer.Option(None, help="Path to signal registry pack [env: SIGNAL_REGISTRY_PATH]"),
+    qlib_dir: Optional[str] = typer.Option(None, help="Optional Qlib data dir [env: QLIB_DIR]"),
+    run_signals: bool = typer.Option(True, help="Run signals_run to upsert forecasts after weighting"),
 ) -> None:
     settings = Settings()
     if symbols:
@@ -925,18 +941,34 @@ def refresh_daily(
         raise typer.BadParameter("No symbols provided")
 
     train_walkforward(
-        bars=r"C:\Users\Stas\Downloads\HistoricalData_1769169971316.csv",
-        labels=r"C:\Users\Stas\Downloads\signals_rows.csv",
-        signals=r"C:\Users\Stas\Downloads\signal_registry_top50_pack.zip",
+        bars=bars,
+        labels=labels,
+        signals=signals,
         expand_rules=True,
         horizon=5,
         top_rules=8,
         news_path=None,
         social_path=None,
-        qlib_dir=None,
+        qlib_dir=qlib_dir,
         mode="lean",
         method="hedge",
     )
+
+    if run_signals:
+        sig_path = labels or os.getenv("SIGNALS_PATH")
+        signal_doc_path = os.getenv("SIGNAL_DOC_PATH")
+        if not sig_path or not Path(sig_path).exists():
+            logger.warning("signals_run skipped; SIGNALS_PATH not set or file missing")
+        else:
+            signals_run(
+                signals_path=sig_path,
+                signal_doc_path=signal_doc_path,
+                mode="lean",
+                method="hedge",
+                max_rows=None,
+                chunk_size=25,
+            )
+
     for t in tickers:
         fetch_bars(
             symbol=t,
