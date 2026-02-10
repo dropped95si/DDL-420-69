@@ -35,3 +35,4 @@ src/ddl69/**/__pycache__/
 .cache/
 ddl-69/
 artifacts/
+.vercel
