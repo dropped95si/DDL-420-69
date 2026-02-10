@@ -1,5 +1,5 @@
 {
-  "buildCommand": "npm run build 2>/dev/null || echo 'No build needed for static UI'",
+  "buildCommand": "echo 'Static UI deployment'",
   "outputDirectory": "ui",
   "public": false,
   "rewrites": [
@@ -8,10 +8,6 @@
       "destination": "/ui/index.html"
     }
   ],
-  "env": {
-    "SUPABASE_URL": "@supabase_url",
-    "SUPABASE_ANON_KEY": "@supabase_anon_key"
-  },
   "git": {
     "deploymentEnabled": {
       "main": true
