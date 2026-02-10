@@ -72,6 +72,10 @@ This repo can integrate with open-source research stacks, but they are optional 
 - Recommended mapping: `app.stazmediacorp.com` (Primary), `www.app…` -> 308 to app.
 - Do **not** attach `stazmediacorp.com` here (that’s the parent site).
 - Do **not** attach `agilera.ai` here (that’s the Agilera marketing site).
+
+## Live URLs (intended)
+- App: `https://app.stazmediacorp.com`
+- Vercel default: `https://ddl-420-69.vercel.app` (fallback/testing)
 - FinRL: https://github.com/AI4Finance-Foundation/FinRL
 - FinGPT: https://github.com/AI4Finance-Foundation/FinGPT
 - Qlib: https://github.com/microsoft/qlib
