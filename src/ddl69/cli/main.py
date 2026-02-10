@@ -31,7 +31,26 @@ from ddl69.utils.signals import (
 )
 from ddl69.utils.rule_expander import expand_signals_rows
 from ddl69.utils.universe import sp500_members_asof
+from ddl69.utils.validators import (
+    validate_file_path,
+    validate_directory_path,
+    validate_region,
+    validate_timeframe,
+    validate_tickers,
+    validate_channel_ids,
+    validate_max_rows,
+    safe_env_for_subprocess,
+    ValidationError,
+)
 import importlib.util
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(add_completion=False)
 
@@ -163,169 +182,190 @@ def clean_data(
 @app.command()
 def signals_run(
     signals_path: str = typer.Option(
-        "C:\\Users\\Stas\\Downloads\\signals_rows.csv",
-        help="Path to signals_rows.csv",
+        ...,
+        "--signals-path",
+        envvar="SIGNALS_PATH",
+        help="Path to signals_rows.csv [env: SIGNALS_PATH]",
     ),
     signal_doc_path: Optional[str] = typer.Option(
-        "C:\\Users\\Stas\\Downloads\\SignalDoc.csv",
-        help="Optional SignalDoc.csv path for artifact logging",
+        None,
+        "--signal-doc-path",
+        envvar="SIGNAL_DOC_PATH",
+        help="Optional SignalDoc.csv path [env: SIGNAL_DOC_PATH]",
     ),
     mode: str = typer.Option("lean", help="Run mode"),
     method: str = typer.Option("hedge", help="Ensemble method name"),
     max_rows: Optional[int] = typer.Option(None, help="Limit number of rows"),
     chunk_size: int = typer.Option(25, help="Batch size for Supabase inserts"),
 ) -> None:
-    settings = Settings()
-    ledger = SupabaseLedger(settings)
-    store = ParquetStore(settings)
+    try:
+        # Validate inputs
+        signals_file = validate_file_path(signals_path, max_size_mb=1000)
+        max_rows = validate_max_rows(max_rows)
 
-    df = load_signals_rows(signals_path)
-    if max_rows is not None:
-        df = df.head(max_rows)
+        if signal_doc_path:
+            signal_doc_file = validate_file_path(signal_doc_path, max_size_mb=500, must_exist=False)
 
-    now = datetime.now(timezone.utc)
-    run_id = ledger.create_run(
-        asof_ts=now, mode=mode, config_hash="signals_rows", code_version="0.1.0"
-    )
-    print(f"Created run_id={run_id}")
+        settings = Settings()
+        ledger = SupabaseLedger(settings)
+        store = ParquetStore(settings)
 
-    # store raw signals_rows as artifact
-    artifact = store.write_df(df, kind="signals", name=f"signals_rows_{now.date().isoformat()}")
-    ledger.insert_artifact(
-        run_id=run_id,
-        kind="raw",
-        uri=artifact.uri,
-        sha256=artifact.sha256,
-        row_count=artifact.rows,
-        meta_json={"source": signals_path},
-    )
+        df = load_signals_rows(str(signals_file))
+        if max_rows is not None:
+            df = df.head(max_rows)
 
-    if signal_doc_path and Path(signal_doc_path).exists():
-        signal_doc_df = load_dataframe(signal_doc_path)
-        doc_art = store.write_df(
-            signal_doc_df, kind="signals", name=f"signal_doc_{now.date().isoformat()}"
+        now = datetime.now(timezone.utc)
+        run_id = ledger.create_run(
+            asof_ts=now, mode=mode, config_hash="signals_rows", code_version="0.1.0"
         )
+        logger.info(f"Created run_id={run_id}")
+
+        # store raw signals_rows as artifact
+        artifact = store.write_df(df, kind="signals", name=f"signals_rows_{now.date().isoformat()}")
         ledger.insert_artifact(
             run_id=run_id,
-            kind="other",
-            uri=doc_art.uri,
-            sha256=doc_art.sha256,
-            row_count=doc_art.rows,
-            meta_json={"source": signal_doc_path},
+            kind="raw",
+            uri=artifact.uri,
+            sha256=artifact.sha256,
+            row_count=artifact.rows,
+            meta_json={"source": str(signals_file)},
         )
 
-    batch_events: list[dict[str, Any]] = []
-    batch_experts: list[dict[str, Any]] = []
-    batch_ensembles: list[dict[str, Any]] = []
+        if signal_doc_path and Path(signal_doc_path).exists():
+            signal_doc_df = load_dataframe(signal_doc_path)
+            doc_art = store.write_df(
+                signal_doc_df, kind="signals", name=f"signal_doc_{now.date().isoformat()}"
+            )
+            ledger.insert_artifact(
+                run_id=run_id,
+                kind="other",
+                uri=doc_art.uri,
+                sha256=doc_art.sha256,
+                row_count=doc_art.rows,
+                meta_json={"source": signal_doc_path},
+            )
 
-    def flush_batches() -> None:
-        if batch_events:
-            ledger.upsert_events(batch_events)
-            batch_events.clear()
-        if batch_experts:
-            ledger.upsert_expert_forecasts(batch_experts)
-            batch_experts.clear()
-        if batch_ensembles:
-            ledger.upsert_ensemble_forecasts(batch_ensembles)
-            batch_ensembles.clear()
+        batch_events: list[dict[str, Any]] = []
+        batch_experts: list[dict[str, Any]] = []
+        batch_ensembles: list[dict[str, Any]] = []
 
-    for _, row in df.iterrows():
-        ticker = str(row.get("ticker", "")).upper()
-        if not ticker:
-            continue
+        def flush_batches() -> None:
+            if batch_events:
+                ledger.upsert_events(batch_events)
+                batch_events.clear()
+            if batch_experts:
+                ledger.upsert_expert_forecasts(batch_experts)
+                batch_experts.clear()
+            if batch_ensembles:
+                ledger.upsert_ensemble_forecasts(batch_ensembles)
+                batch_ensembles.clear()
 
-        created_at = row.get("created_at")
-        asof_ts = (
-            pd.to_datetime(created_at, utc=True)
-            if created_at is not None
-            else now
-        )
-        event_id = str(row.get("id") or f"{ticker}|signal|{asof_ts.date().isoformat()}")
-
-        event_params = {
-            "plan_type": row.get("plan_type"),
-            "label": row.get("label"),
-            "entry": row.get("entry"),
-            "stop": row.get("stop"),
-            "targets": row.get("targets"),
-        }
-        context = {
-            "rs_lookback": row.get("rs_lookback"),
-            "rs_vs_spy": row.get("rs_vs_spy"),
-            "vol_z": row.get("vol_z"),
-            "fv": row.get("fv"),
-            "pivots": row.get("pivots"),
-            "fib": row.get("fib"),
-            "learned_top_rules": row.get("learned_top_rules"),
-        }
-        event_params = sanitize_json(event_params)
-        context = sanitize_json(context)
-
-        batch_events.append(
-            {
-                "event_id": event_id,
-                "subject_type": "ticker",
-                "subject_id": ticker,
-                "event_type": "state_event",
-                "asof_ts": asof_ts.isoformat(),
-                "horizon_json": {"type": "time", "value": 5, "unit": "d"},
-                "event_params_json": event_params,
-                "context_json": context,
-            }
-        )
-
-        rules = row.get("learned_top_rules") or []
-        weights = weights_from_rules(rules) if isinstance(rules, list) else {}
-
-        weighted_probs = []
-        for rule in rules:
-            if not isinstance(rule, dict):
+        for _, row in df.iterrows():
+            ticker = str(row.get("ticker", "")).upper()
+            if not ticker:
                 continue
-            name = str(rule.get("rule") or "unknown_rule")
-            probs = rule_to_probs(rule)
-            conf = float(probs.get("ACCEPT_CONTINUE", 0.5))
-            batch_experts.append(
+
+            created_at = row.get("created_at")
+            asof_ts = (
+                pd.to_datetime(created_at, utc=True)
+                if created_at is not None
+                else now
+            )
+            event_id = str(row.get("id") or f"{ticker}|signal|{asof_ts.date().isoformat()}")
+
+            event_params = {
+                "plan_type": row.get("plan_type"),
+                "label": row.get("label"),
+                "entry": row.get("entry"),
+                "stop": row.get("stop"),
+                "targets": row.get("targets"),
+            }
+            context = {
+                "rs_lookback": row.get("rs_lookback"),
+                "rs_vs_spy": row.get("rs_vs_spy"),
+                "vol_z": row.get("vol_z"),
+                "fv": row.get("fv"),
+                "pivots": row.get("pivots"),
+                "fib": row.get("fib"),
+                "learned_top_rules": row.get("learned_top_rules"),
+            }
+            event_params = sanitize_json(event_params)
+            context = sanitize_json(context)
+
+            batch_events.append(
                 {
-                    "run_id": run_id,
                     "event_id": event_id,
-                    "expert_name": name,
-                    "expert_version": "signals_rows",
-                    "probs_json": probs,
-                    "confidence": conf,
-                    "uncertainty_json": {"entropy": entropy(probs)},
-                    "loss_hint": "logloss",
-                    "supports_calibration": True,
-                    "calibration_group": str(row.get("plan_type") or "signals"),
-                    "features_uri": None,
-                    "artifact_uris": [],
-                    "reasons_json": [],
-                    "debug_json": sanitize_json({"rule": rule}),
+                    "subject_type": "ticker",
+                    "subject_id": ticker,
+                    "event_type": "state_event",
+                    "asof_ts": asof_ts.isoformat(),
+                    "horizon_json": {"type": "time", "value": 5, "unit": "d"},
+                    "event_params_json": event_params,
+                    "context_json": context,
                 }
             )
-            w = weights.get(name, 0.0)
-            weighted_probs.append((probs, w))
 
-        if weighted_probs:
-            ensemble_probs = blend_probs(weighted_probs)
-            batch_ensembles.append(
-                {
-                    "run_id": run_id,
-                    "event_id": event_id,
-                    "method": method,
-                    "probs_json": ensemble_probs,
-                    "confidence": float(ensemble_probs.get("ACCEPT_CONTINUE", 0.5)),
-                    "uncertainty_json": {"entropy": entropy(ensemble_probs)},
-                    "weights_json": weights,
-                    "explain_json": {"source": "signals_rows"},
-                    "artifact_uris": [],
-                }
-            )
+            rules = row.get("learned_top_rules") or []
+            weights = weights_from_rules(rules) if isinstance(rules, list) else {}
 
-        if len(batch_events) >= chunk_size or len(batch_experts) >= chunk_size or len(batch_ensembles) >= chunk_size:
-            flush_batches()
+            weighted_probs = []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                name = str(rule.get("rule") or "unknown_rule")
+                probs = rule_to_probs(rule)
+                conf = float(probs.get("ACCEPT_CONTINUE", 0.5))
+                batch_experts.append(
+                    {
+                        "run_id": run_id,
+                        "event_id": event_id,
+                        "expert_name": name,
+                        "expert_version": "signals_rows",
+                        "probs_json": probs,
+                        "confidence": conf,
+                        "uncertainty_json": {"entropy": entropy(probs)},
+                        "loss_hint": "logloss",
+                        "supports_calibration": True,
+                        "calibration_group": str(row.get("plan_type") or "signals"),
+                        "features_uri": None,
+                        "artifact_uris": [],
+                        "reasons_json": [],
+                        "debug_json": sanitize_json({"rule": rule}),
+                    }
+                )
+                w = weights.get(name, 0.0)
+                weighted_probs.append((probs, w))
 
-    flush_batches()
-    print("Signals run completed")
+            if weighted_probs:
+                ensemble_probs = blend_probs(weighted_probs)
+                batch_ensembles.append(
+                    {
+                        "run_id": run_id,
+                        "event_id": event_id,
+                        "method": method,
+                        "probs_json": ensemble_probs,
+                        "confidence": float(ensemble_probs.get("ACCEPT_CONTINUE", 0.5)),
+                        "uncertainty_json": {"entropy": entropy(ensemble_probs)},
+                        "weights_json": weights,
+                        "explain_json": {"source": "signals_rows"},
+                        "artifact_uris": [],
+                    }
+                )
+
+            if len(batch_events) >= chunk_size or len(batch_experts) >= chunk_size or len(batch_ensembles) >= chunk_size:
+                flush_batches()
+
+        flush_batches()
+        logger.info("Signals run completed")
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        raise typer.BadParameter(str(e))
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        raise typer.BadParameter(str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error in signals_run: {type(e).__name__}: {e}")
+        raise
 
 
 @app.command()
@@ -544,24 +584,34 @@ def _fetch_polygon(
     limit: int,
 ) -> pd.DataFrame:
     if not settings.polygon_api_key:
-        raise RuntimeError("POLYGON_API_KEY not set")
+        raise RuntimeError("POLYGON_API_KEY not set in environment")
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/"
         f"{multiplier}/{timespan}/{from_date}/{to_date}"
     )
+    # Use headers instead of URL params for API key (SECURITY FIX)
+    headers = {
+        "Authorization": f"Bearer {settings.polygon_api_key}",
+    }
     params = {
         "adjusted": "true" if adjusted else "false",
         "sort": "asc",
         "limit": limit,
-        "apiKey": settings.polygon_api_key,
     }
-    resp = requests.get(url, params=params, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Polygon error {resp.status_code}: {resp.text}")
-    data = resp.json()
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code != 200:
+            # Don't expose full response text which could contain sensitive data
+            logger.error(f"Polygon API error {resp.status_code}")
+            raise RuntimeError(f"Polygon API returned status {resp.status_code}")
+        data = resp.json()
+    except requests.RequestException as e:
+        logger.error(f"Polygon request failed: {type(e).__name__}")
+        raise RuntimeError("Failed to fetch data from Polygon API") from e
+
     results = data.get("results") or []
     if not results:
-        raise RuntimeError("Polygon returned 0 bars")
+        raise RuntimeError("Polygon returned no data for the requested period")
     df = pd.DataFrame(results).rename(
         columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "timestamp"}
     )
@@ -580,7 +630,7 @@ def _fetch_alpaca(
     limit: int,
 ) -> pd.DataFrame:
     if not settings.alpaca_api_key or not settings.alpaca_secret_key:
-        raise RuntimeError("ALPACA_API_KEY/ALPACA_SECRET_KEY not set")
+        raise RuntimeError("ALPACA_API_KEY or ALPACA_SECRET_KEY not set in environment")
     url = "https://data.alpaca.markets/v2/stocks/bars"
     headers = {
         "APCA-API-KEY-ID": settings.alpaca_api_key,
@@ -594,13 +644,20 @@ def _fetch_alpaca(
         "limit": limit,
         "adjustment": "all",
     }
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Alpaca error {resp.status_code}: {resp.text}")
-    data = resp.json()
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code != 200:
+            # Don't expose full response which might contain headers/sensitive data
+            logger.error(f"Alpaca API error {resp.status_code}")
+            raise RuntimeError(f"Alpaca API returned status {resp.status_code}")
+        data = resp.json()
+    except requests.RequestException as e:
+        logger.error(f"Alpaca request failed: {type(e).__name__}")
+        raise RuntimeError("Failed to fetch data from Alpaca API") from e
+
     bars = (data.get("bars") or {}).get(symbol) or []
     if not bars:
-        raise RuntimeError("Alpaca returned 0 bars")
+        raise RuntimeError("Alpaca returned no data for the requested symbol")
     df = pd.DataFrame(bars).rename(
         columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "t": "timestamp"}
     )
@@ -987,26 +1044,42 @@ def tools_status() -> None:
 
 @app.command()
 def discord_pull(
-    token: str = typer.Option(..., help="Discord bot token"),
     channels: str = typer.Option(..., help="Comma-separated channel IDs"),
+    token: Optional[str] = typer.Option(
+        None,
+        envvar="DISCORD_TOKEN",
+        help="Discord bot token [env: DISCORD_TOKEN] (do not pass on cmdline)",
+    ),
     limit: int = typer.Option(200, help="Messages per channel"),
     after: Optional[str] = typer.Option(None, help="ISO timestamp (optional)"),
     before: Optional[str] = typer.Option(None, help="ISO timestamp (optional)"),
     output_path: Optional[str] = typer.Option(None, help="Output JSON path"),
 ) -> None:
     """Pull recent Discord messages into a JSON artifact."""
-    from ddl69.integrations.discord_ingest import parse_channel_ids, pull_messages
+    from ddl69.integrations.discord_ingest import pull_messages
 
-    after_dt = pd.to_datetime(after, utc=True) if after else None
-    before_dt = pd.to_datetime(before, utc=True) if before else None
-    channel_ids = parse_channel_ids(channels)
-    data = pull_messages(token=token, channel_ids=channel_ids, limit=limit, after=after_dt, before=before_dt)
+    if not token:
+        raise typer.BadParameter(
+            "Discord token required. Set DISCORD_TOKEN environment variable."
+        )
 
-    out_dir = Path("artifacts") / "social"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = Path(output_path) if output_path else out_dir / f"discord_messages_{datetime.now(timezone.utc).date().isoformat()}.json"
-    out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    print(f"Wrote Discord messages: {out_path}")
+    try:
+        after_dt = pd.to_datetime(after, utc=True) if after else None
+        before_dt = pd.to_datetime(before, utc=True) if before else None
+        channel_ids = validate_channel_ids(channels)
+        data = pull_messages(token=token, channel_ids=channel_ids, limit=limit, after=after_dt, before=before_dt)
+
+        out_dir = Path("artifacts") / "social"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = Path(output_path) if output_path else out_dir / f"discord_messages_{datetime.now(timezone.utc).date().isoformat()}.json"
+        out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info(f"Wrote Discord messages: {out_path}")
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        raise typer.BadParameter(str(e))
+    except Exception as e:
+        logger.error(f"Discord pull failed: {type(e).__name__}: {e}")
+        raise
 
 
 @app.command()
@@ -1162,15 +1235,27 @@ def qlib_check(qlib_dir: str = typer.Option(..., help="Qlib data directory")) ->
 
 
 def _extract_tar_gz_strip_first(src_path: Path, dest_dir: Path) -> None:
+    """Safely extract tar.gz file with path traversal protection."""
+    dest_resolved = dest_dir.resolve()
+
     with tarfile.open(src_path, "r:gz") as tar:
         members = tar.getmembers()
         for member in members:
             parts = member.name.split("/")
             if len(parts) <= 1:
                 continue
+
+            # Strip first path component
             member.name = "/".join(parts[1:])
             if not member.name:
                 continue
+
+            # SECURITY FIX: Validate path doesn't escape destination
+            full_path = (dest_resolved / member.name).resolve()
+            if not str(full_path).startswith(str(dest_resolved)):
+                logger.warning(f"Skipping malicious path: {member.name}")
+                continue
+
             tar.extract(member, path=dest_dir)
 
 
@@ -1185,29 +1270,46 @@ def qlib_download(
     ),
 ) -> None:
     """Download Qlib data into a local directory."""
-    dest = Path(target_dir)
-    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        # Validate inputs - SECURITY FIX for command injection
+        region = validate_region(region, allowed=["us", "cn"])
+        if interval:
+            interval = validate_timeframe(interval)
 
-    if use_community:
-        url = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            archive_path = Path(tmpdir) / "qlib_bin.tar.gz"
-            urllib.request.urlretrieve(url, archive_path)
-            _extract_tar_gz_strip_first(archive_path, dest)
-        print(f"Downloaded community Qlib data to {dest}")
-        return
+        dest = validate_directory_path(target_dir, create=True)
 
-    if importlib.util.find_spec("qlib") is None:
-        raise RuntimeError("qlib not installed; install from the Qlib GitHub repo")
+        if use_community:
+            url = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                archive_path = Path(tmpdir) / "qlib_bin.tar.gz"
+                urllib.request.urlretrieve(url, archive_path)
+                _extract_tar_gz_strip_first(archive_path, dest)
+            logger.info(f"Downloaded community Qlib data to {dest}")
+            return
 
-    cmd = [sys.executable, "-m", "qlib.cli.data", "qlib_data", "--target_dir", str(dest), "--region", region]
-    if interval:
-        cmd.extend(["--interval", interval])
-    env = os.environ.copy()
-    result = subprocess.run(cmd, check=False, env=env)
-    if result.returncode != 0:
-        raise RuntimeError(f"Qlib download failed (exit code {result.returncode})")
-    print(f"Downloaded Qlib data to {dest}")
+        if importlib.util.find_spec("qlib") is None:
+            raise ImportError("qlib not installed; install from the Qlib GitHub repo")
+
+        # Use safe environment with only essential variables
+        safe_env = safe_env_for_subprocess()
+
+        cmd = [sys.executable, "-m", "qlib.cli.data", "qlib_data", "--target_dir", str(dest), "--region", region]
+        if interval:
+            cmd.extend(["--interval", interval])
+
+        result = subprocess.run(cmd, check=False, env=safe_env)
+        if result.returncode != 0:
+            raise RuntimeError(f"Qlib download failed (exit code {result.returncode})")
+        logger.info(f"Downloaded Qlib data to {dest}")
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        raise typer.BadParameter(str(e))
+    except ImportError as e:
+        logger.error(f"Import error: {e}")
+        raise typer.BadParameter(str(e))
+    except subprocess.SubprocessError as e:
+        logger.error(f"Subprocess error: {e}")
+        raise RuntimeError(f"Qlib download failed: {type(e).__name__}") from e
 
 
 @app.command()
