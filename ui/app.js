@@ -36,7 +36,15 @@ async function loadDashboardData() {
         fetchAPI('/api/events')
     ]);
 
-    if (forecasts) initForecastChart(forecasts.forecasts || []);
+    if (forecasts && forecasts.forecasts?.length) {
+        currentForecasts = forecasts.forecasts;
+    } else {
+        currentForecasts = sampleForecasts;
+    }
+
+    initForecastChart(currentForecasts || []);
+    renderForecastList(currentForecasts || []);
+
     if (calibration) initCalibrationChart(calibration.calibration_curve || []);
     if (events) loadEventsStream(events.events || []);
 }
@@ -242,3 +250,58 @@ setInterval(loadDashboardData, 5 * 60 * 1000);
 console.log('[DDL-69] Dashboard initialized');
 console.log('[DDL-69] API Version: v0.2.0');
 console.log('[DDL-69] Auto-refresh: 5 minutes');
+
+// ---------- Forecast list + fallback ----------
+
+const sampleForecasts = [
+    { ticker: 'AAPL', accept: 0.72, reject: 0.18, continue: 0.10, date: '2026-02-10T14:00:00Z', label: 'Earnings drift up' },
+    { ticker: 'MSFT', accept: 0.64, reject: 0.22, continue: 0.14, date: '2026-02-10T14:00:00Z', label: 'Cloud beat probability' },
+    { ticker: 'NVDA', accept: 0.58, reject: 0.30, continue: 0.12, date: '2026-02-10T14:00:00Z', label: 'Gamma squeeze risk' },
+    { ticker: 'TSLA', accept: 0.41, reject: 0.45, continue: 0.14, date: '2026-02-10T14:00:00Z', label: 'Range-bound after delivery miss' },
+    { ticker: 'AMZN', accept: 0.55, reject: 0.28, continue: 0.17, date: '2026-02-10T14:00:00Z', label: 'Retail strength, ad growth' }
+];
+
+let currentForecasts = sampleForecasts;
+
+function renderForecastList(forecasts) {
+    const tbody = document.getElementById('forecastTableBody');
+    const countEl = document.getElementById('forecastCount');
+    if (!tbody) return;
+
+    tbody.innerHTML = '';
+    (forecasts || []).forEach(f => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${f.ticker || '—'}</td>
+            <td>${(f.accept ?? 0).toFixed(2)}</td>
+            <td>${(f.reject ?? 0).toFixed(2)}</td>
+            <td>${(f.continue ?? 0).toFixed(2)}</td>
+            <td>${f.label || '—'}</td>
+            <td>${new Date(f.date).toLocaleString()}</td>
+        `;
+        tbody.appendChild(row);
+    });
+    if (countEl) countEl.textContent = forecasts?.length ?? 0;
+}
+
+function openForecastModal() {
+    const modal = document.getElementById('forecastModal');
+    if (modal) modal.classList.add('open');
+    renderForecastList(currentForecasts);
+}
+
+function closeForecastModal() {
+    const modal = document.getElementById('forecastModal');
+    if (modal) modal.classList.remove('open');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const card = document.getElementById('forecastsCard');
+    const closeBtn = document.getElementById('forecastModalClose');
+    if (card) card.addEventListener('click', openForecastModal);
+    if (closeBtn) closeBtn.addEventListener('click', closeForecastModal);
+    const overlay = document.querySelector('.modal-overlay');
+    if (overlay) overlay.addEventListener('click', (e) => {
+        if (e.target.classList.contains('modal-overlay')) closeForecastModal();
+    });
+});
