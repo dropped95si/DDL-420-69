@@ -1,7 +1,7 @@
 {
   "buildCommand": "echo 'Static UI deployment'",
   "outputDirectory": "ui",
-  "public": false,
+  "public": true,
   "rewrites": [
     {
       "source": "/(.*)",
